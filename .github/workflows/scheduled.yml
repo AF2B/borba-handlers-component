@@ -1,0 +1,21 @@
+name: Scheduled
+
+# What changes without a commit: outdated dependencies, newly published
+# vulnerabilities and new secret patterns. Findings arrive as a failed run or as
+# the "Outdated dependencies" issue.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scheduled:
+    name: Scheduled
+    uses: AF2B/borba-tooling/.github/workflows/clojure-lib-scheduled.yml@d088e5daeae9ff381bcd9891e835196f5bb93cce # v0.1.3
+    permissions:
+      contents: read
+      issues: write
