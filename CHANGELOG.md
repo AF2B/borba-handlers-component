@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-06
+
 ### Added
 
 - `request-id`, which gives each request an id, from the `X-Request-Id` header when it is safe to log and a UUID otherwise, and
@@ -53,5 +55,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 First release: the `handler`, `interceptor` and `handler-interceptors` registries, the `:service/handlers` Integrant component
 and the interceptors that parse the request and write the response as JSON.
 
-[Unreleased]: https://github.com/AF2B/borba-handlers-component/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/AF2B/borba-handlers-component/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/AF2B/borba-handlers-component/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/AF2B/borba-handlers-component/releases/tag/v1.0.0
