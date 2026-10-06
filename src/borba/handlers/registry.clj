@@ -1,91 +1,55 @@
 (ns borba.handlers.registry
-  "Handler and interceptor registry via defmulti.
+  "The registry of the handlers of a service, one `defmethod` per handler,
+   which `:service/handlers` turns into chains of interceptors.
 
-   Handlers and interceptors are registered by keyword in the service code
-   and automatically discovered by the :service/handlers Integrant component.
+   A handler is registered under the keyword that routes refer to it by. The
+   method receives the components of the service, to close over what the
+   handler needs, and returns the function that handles the requests:
 
-   ── Registering a handler ────────────────────────────────────────────────────
-
-     (defmethod borba.handlers.registry/handler :user/create [_ _]
-       user-create-handler)
-
-   The defmethod receives [dispatch-key components] so you can optionally
-   close over components for stateful handlers:
-
-     (defmethod borba.handlers.registry/handler :user/create [_ {:keys [cache]}]
+     (defmethod registry/handler :user/create
+       [_ {:keys [db]}]
        (fn [{:keys [body-params]}]
-         ;; cache is available via closure
-         ...))
+         {:status 201 :body (users/create! db body-params)}))
 
-   ── Handler function signature ───────────────────────────────────────────────
+   The function receives one map and returns an HTTP response map, whose :body
+   is written as JSON when it is a map or a collection:
 
-   Each handler function receives a single flat map:
+     :components     the components of the service
+     :body-params    the JSON body, as data with keyword keys; {} without a body
+     :query-params   the query string, as a map with keyword keys
+     :path-params    the parameters of the path
+     :header-params  the headers, with lower-case string keys
+     :request-id     the id of the request, also in the logs and the response
+     :request        the Ring request, for what the rest does not cover
 
-     (defn user-create-handler
-       [{:keys [components body-params query-params path-params header-params]}]
-       {:status 201 :body {:id ...)})
+   To run more interceptors for one handler, after the ones every handler has,
+   list their keywords. They are the ones registered with
+   borba.interceptors.registry, and they are built into the map that
+   `:service/handlers` takes as :interceptors:
 
-   It must return an HTTP response map {:status N :body ...}.
-
-   ── Extra interceptors per handler ──────────────────────────────────────────
-
-   To attach additional interceptors to a specific handler, override
-   handler-interceptors:
-
-     (defmethod borba.handlers.registry/handler-interceptors :admin/dashboard [_]
-       [:auth/admin-check :audit/log-access])
-
-   The interceptor keywords are resolved via the `interceptor` defmulti:
-
-     (defmethod borba.handlers.registry/interceptor :auth/admin-check [_ components]
-       {:name  :auth/admin-check
-        :enter (fn [ctx]
-                 (let [token (get-in ctx [:request :headers-map \"authorization\"])]
-                   (if (valid-token? token)
-                     ctx
-                     (throw (ex-info \"Unauthorized\" {:status 401})))))})")
-
-;; ── Handler registry ─────────────────────────────────────────────────────────
+     (defmethod registry/handler-interceptors :admin/dashboard
+       [_]
+       [:auth/admin :audit/log-access])")
 
 (defmulti handler
-  "Registry for route handlers. Dispatches on handler-key keyword.
-
-   Usage:
-     (defmethod borba.handlers.registry/handler :user/create [_ _]
-       user-create-handler)"
+  "Builds the function that handles the requests of a handler key.
+   - dispatch-key: the keyword that routes refer to the handler by
+   - components: the components of the service, as `:service/handlers` was
+     given them"
   (fn [dispatch-key _components] dispatch-key))
 
-(defmethod handler :default [k _]
-  (throw (ex-info (str "[handlers] No handler registered for: " k)
-                  {:handler-key k})))
-
-;; ── Interceptor registry ─────────────────────────────────────────────────────
-
-(defmulti interceptor
-  "Registry for custom interceptors. Dispatches on interceptor-key keyword.
-
-   Usage:
-     (defmethod borba.handlers.registry/interceptor :auth/check [_ components]
-       {:name  :auth/check
-        :enter (fn [ctx] ...)})"
-  (fn [dispatch-key _components] dispatch-key))
-
-(defmethod interceptor :default [k _]
-  (throw (ex-info (str "[handlers] No interceptor registered for: " k)
-                  {:interceptor-key k})))
-
-;; ── Per-handler extra interceptors ───────────────────────────────────────────
+(defmethod handler :default
+  [dispatch-key _components]
+  (throw (ex-info (str "no handler is registered for " dispatch-key)
+                  {:error       ::no-handler
+                   :handler-key dispatch-key})))
 
 (defmulti handler-interceptors
-  "Returns a vector of interceptor keys to prepend to a handler's chain.
-   Override per handler to attach custom interceptors.
-
-   Default: no extra interceptors.
-
-   Usage:
-     (defmethod borba.handlers.registry/handler-interceptors :admin/dashboard [_]
-       [:auth/admin-check :audit/log-access])"
+  "Returns the keywords of the interceptors to run for a handler, after the
+   ones every handler has. There are none unless a method says so.
+   - dispatch-key: the keyword that routes refer to the handler by"
   (fn [dispatch-key] dispatch-key))
 
-(defmethod handler-interceptors :default [_]
+(defmethod handler-interceptors :default
+  [_dispatch-key]
   [])

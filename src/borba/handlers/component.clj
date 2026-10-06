@@ -1,78 +1,179 @@
 (ns borba.handlers.component
-  "Integrant component for :service/handlers.
+  "The Integrant component that builds the chain of every registered handler:
 
-   Automatically discovers all handlers registered via
-   borba.handlers.registry/handler defmulti and builds their
-   Pedestal interceptor chains.
+     :service/handlers
+     {:components     #ig/ref :service/components
+      :interceptors   #ig/ref :service/interceptors
+      :max-body-bytes 1048576}
 
-   Chain structure (per handler):
-     [error-handler
-      inject-components
-      parse-body
-      parse-query
-      parse-path-params
-      parse-headers
-      json-response
-      ...custom interceptors from handler-interceptors defmulti...
-      <handler interceptor>]
+   Its value is a map from the handler key to its chain, a map of :chain, the
+   interceptors that run before the handler, and :handler, the interceptor that
+   calls it. `:http/routes` puts the interceptors of a route between the two.
 
-   The handler interceptor wraps the handler function and normalises
-   the request into a flat map before calling it:
-     {:keys [components body-params query-params path-params header-params]}
+   The chain is the one of borba.handlers.interceptors, then the interceptors
+   the handler asks for with borba.handlers.registry/handler-interceptors,
+   which are looked up in :interceptors, the map that `:service/interceptors`
+   builds. A handler that is not a function, or that asks for an interceptor
+   that is not there, fails the start naming it.
 
-   The handler function must return an HTTP response map:
-     {:status 200 :body {...}}"
-  (:require [integrant.core :as ig]
-            [borba.handlers.registry :as registry]
-            [borba.handlers.interceptors :as i]))
+   The key :borba/not-found is the handler of a request that no route matches.
+   It is built here, with a short chain that does not read a body, and it is
+   reserved.
 
-;; ── Internal: wrap handler fn in a Pedestal interceptor ─────────────────────
+   The handlers are found by the `defmethod`s that have been loaded, so the
+   namespaces that register them go under `:service/namespaces`."
+  (:require
+   [borba.handlers.interceptors :as interceptors]
+   [borba.handlers.registry :as registry]
+   [clojure.string :as str]
+   [clojure.tools.logging :as log]
+   [integrant.core :as ig]))
+
+(def not-found-key
+  "The key of the handler of a request that no route matches."
+  :borba/not-found)
+
+(def ^:private status-not-found 404)
+
+(defn- callable?
+  [candidate]
+  (or (fn? candidate) (var? candidate)))
+
+(defn- request-for
+  "Returns what a handler receives, from the context of the chain."
+  [request]
+  {:components    (:components request)
+   :body-params   (:body-params request {})
+   :query-params  (:query-params request {})
+   :path-params   (:path-params request {})
+   :header-params (:headers-map request {})
+   :request-id    (:request-id request)
+   :request       request})
+
+(defn- checked-response
+  "Returns the response of a handler, or throws when it is not one: a map with
+   an integer :status. Without this a handler that returns nil, or a vector,
+   leaves the client waiting or with a 404."
+  [handler-key response]
+  (if (and (map? response) (int? (:status response)))
+    response
+    (throw (ex-info (str "the handler " handler-key
+                         " did not return a response map with a :status")
+                    {:error       ::invalid-response
+                     :handler-key handler-key}))))
 
 (defn- handler->interceptor
-  "Wraps a handler function in a Pedestal :enter interceptor.
-   The handler fn receives a flat request map and must return a response map."
-  [handler-key handler-fn]
+  "Wraps the function of a handler in the interceptor that calls it."
+  [handler-key
+   handler-fn]
   {:name  handler-key
    :enter (fn [ctx]
-            (let [req      (:request ctx)
-                  response (handler-fn
-                            {:components    (:components req)
-                             :body-params   (:body-params req {})
-                             :query-params  (:query-params req {})
-                             :path-params   (:path-params req {})
-                             :header-params (:headers-map req {})})]
-              (assoc ctx :response response)))})
+            (let [response (handler-fn (request-for (:request ctx)))]
+              (assoc ctx :response (checked-response handler-key response))))})
 
-;; ── Internal: build full chain for one handler ──────────────────────────────
+(defn- base-chain
+  "Returns the interceptors every handler runs first."
+  [components
+   max-body-bytes]
+  [interceptors/request-id
+   interceptors/access-log
+   interceptors/http-error-handler
+   (interceptors/inject-components components)
+   interceptors/parse-query
+   interceptors/parse-path-params
+   interceptors/parse-headers
+   (interceptors/body-parser {:max-body-bytes max-body-bytes})
+   interceptors/json-response])
 
-(defn- build-chain
-  "Builds the full interceptor chain for handler-key."
-  [handler-key components inject]
-  (let [handler-fn     (registry/handler handler-key components)
-        extra-keys     (registry/handler-interceptors handler-key)
-        custom-inters  (mapv #(registry/interceptor % components) extra-keys)
-        base-chain     [i/http-error-handler
-                        inject
-                        i/parse-body
-                        i/parse-query
-                        i/parse-path-params
-                        i/parse-headers
-                        i/json-response]
-        handler-inter  (handler->interceptor handler-key handler-fn)]
-    (-> base-chain
-        (into custom-inters)
-        (conj handler-inter))))
+(defn- asked-for
+  "Looks up the interceptors a handler asks for, and fails naming the first one
+   that is not there."
+  [handler-key
+   interceptor-keys
+   available]
+  (mapv (fn [interceptor-key]
+          (or (get available interceptor-key)
+              (throw (ex-info
+                      (str "the handler " handler-key
+                           " asks for the interceptor " interceptor-key
+                           ", which is not registered; is :interceptors"
+                           " configured?")
+                      {:error       ::unknown-interceptor
+                       :handler-key handler-key
+                       :interceptor interceptor-key}))))
+        interceptor-keys))
 
-;; ── Integrant lifecycle ──────────────────────────────────────────────────────
+(defn- build-handler
+  "Builds the chain and the handler interceptor of one handler key."
+  [{:keys [components available base]}
+   handler-key]
+  (let [handler-fn (registry/handler handler-key components)
+        asked      (registry/handler-interceptors handler-key)]
+    (when-not (callable? handler-fn)
+      (throw (ex-info (str "the handler " handler-key " is not a function")
+                      {:error       ::invalid-handler
+                       :handler-key handler-key})))
+    (when-not (sequential? asked)
+      (throw (ex-info (str "handler-interceptors of " handler-key
+                           " must return a vector of keywords")
+                      {:error       ::invalid-handler-interceptors
+                       :handler-key handler-key})))
+    {:chain   (into base (asked-for handler-key asked available))
+     :handler (handler->interceptor handler-key handler-fn)}))
+
+(defn- not-found-chain
+  "Builds the handler of a request that no route matches. It has no body to
+   read and no interceptors to ask for."
+  []
+  {:chain   [interceptors/request-id
+             interceptors/access-log
+             interceptors/http-error-handler
+             interceptors/json-response]
+   :handler {:name  not-found-key
+             :enter (fn [_ctx]
+                      (throw (ex-info "No route matches the request."
+                                      {:status status-not-found
+                                       :error  :not-found})))}})
+
+(defn build
+  "Builds the chain of every registered handler, and returns them in a map from
+   the handler key to its :chain and :handler, with the reserved
+   :borba/not-found among them.
+   - components: the components of the service, handed to each handler
+   - interceptors: the map that `:service/interceptors` builds, where the
+     interceptors a handler asks for are looked up
+   - max-body-bytes: the largest request body in bytes (default 1 MiB)"
+  [{:keys [components interceptors max-body-bytes]
+    :or   {max-body-bytes interceptors/default-max-body-bytes}}]
+  (when-not (and (int? max-body-bytes)
+                 (pos? max-body-bytes)
+                 (< max-body-bytes Integer/MAX_VALUE))
+    (throw (ex-info ":max-body-bytes must be a positive integer"
+                    {:error          ::invalid-max-body-bytes
+                     :max-body-bytes max-body-bytes})))
+  (let [registered (dissoc (methods registry/handler) :default)
+        context    {:components components
+                    :available  (or interceptors {})
+                    :base       (base-chain components max-body-bytes)}]
+    (when (contains? registered not-found-key)
+      (throw (ex-info (str "the handler key " not-found-key " is reserved")
+                      {:error       ::reserved-handler-key
+                       :handler-key not-found-key})))
+    (assoc (into {}
+                 (map (fn [handler-key]
+                        [handler-key (build-handler context handler-key)]))
+                 (keys registered))
+           not-found-key
+           (not-found-chain))))
 
 (defmethod ig/init-key :service/handlers
-  [_ {:keys [components]}]
-  (let [inject       (i/inject-components components)
-        all-handlers (dissoc (methods registry/handler) :default)]
-    (when (empty? all-handlers)
-      (println "⚠️  [handlers] No handlers registered. Did you require your routes namespace?"))
-    (reduce
-     (fn [acc handler-key]
-       (assoc acc handler-key (build-chain handler-key components inject)))
-     {}
-     (keys all-handlers))))
+  [_ options]
+  (let [handlers (build options)
+        names    (sort (map str (remove #{not-found-key} (keys handlers))))]
+    (if (seq names)
+      (log/infof "registered %d handler(s): %s"
+                 (count names)
+                 (str/join ", " names))
+      (log/warn "no handlers are registered; are the namespaces that register"
+                "them listed under :service/namespaces?"))
+    handlers))
