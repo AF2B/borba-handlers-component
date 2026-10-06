@@ -1,0 +1,26 @@
+name: CI
+
+# The quality gate. The steps live in borba-tooling and are the make targets of
+# this repository; see docs/standard.md there.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: CI
+    uses: AF2B/borba-tooling/.github/workflows/clojure-lib.yml@d088e5daeae9ff381bcd9891e835196f5bb93cce # v0.1.3
+    with:
+      postgres: false
+      redis: false
+      kafka: false
