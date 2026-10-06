@@ -50,6 +50,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `parse-body` read only a `BufferedReader` and turned any other body into the text of its object, and Jetty hands over an
   `InputStream`.
 
+### Security
+
+- Pins Jackson to 2.22.3. The 2.22.2 that jsonista 1.0.1 brings has four high advisories (GHSA-7hhh-6rmp-j9qf,
+  GHSA-p6pp-m3f8-5c89, GHSA-cxp5-3px4-pw24 and GHSA-wv8q-qhhj-9h54), which the dependency scan of the pipeline reported.
+
 ## [1.0.0] - 2026-03-29
 
 First release: the `handler`, `interceptor` and `handler-interceptors` registries, the `:service/handlers` Integrant component
